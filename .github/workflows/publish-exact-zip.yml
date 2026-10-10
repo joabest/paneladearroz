@@ -1,0 +1,38 @@
+name: Publicar ZIP original exato
+
+on:
+  push:
+    paths:
+      - '.github/workflows/publish-exact-zip.yml'
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+jobs:
+  publish:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Baixar e validar ZIP original
+        shell: bash
+        run: |
+          set -euo pipefail
+          curl -fL --retry 3 'https://drive.usercontent.google.com/download?id=1ITxP6CTs66jPj-AhWpx8wi_J_A5N9-v8&export=download&confirm=t' -o /tmp/site.zip
+          echo '64ae1d5c3cb51413ba3826d1edc4b1bf760ef18e6c3ca876760a66debbb5f816  /tmp/site.zip' | sha256sum -c -
+          rm -rf /tmp/site && mkdir -p /tmp/site
+          unzip -q /tmp/site.zip -d /tmp/site
+          test -f /tmp/site/index.html
+          test "$(find /tmp/site -type f | wc -l | tr -d ' ')" = '88'
+      - name: Substituir pelo ZIP
+        shell: bash
+        run: |
+          set -euo pipefail
+          git rm -rf .
+          cp -a /tmp/site/. .
+          git add -A
+          test "$(find . -path './.git' -prune -o -type f -print | wc -l | tr -d ' ')" = '88'
+          git config user.name 'github-actions[bot]'
+          git config user.email '41898282+github-actions[bot]@users.noreply.github.com'
+          git commit -m 'Publicar conteúdo exato do ZIP original'
+          git push origin HEAD:test
