@@ -1,0 +1,162 @@
+name: Importar site original
+
+on:
+  push:
+    paths:
+      - '.github/workflows/importar-site-original.yml'
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+jobs:
+  importar:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Preparar Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+
+      - name: Instalar dependências
+        run: pip install requests beautifulsoup4
+
+      - name: Baixar e adaptar página original
+        env:
+          SOURCE_URL: https://www.zema.com/panela-de-arroz-mondial-bianca-nep05/P7292S1Zema
+        run: |
+          cat > /tmp/importar.py <<'PY'
+          import os, re, hashlib, mimetypes
+          from pathlib import Path
+          from urllib.parse import urljoin, urlparse
+          import requests
+          from bs4 import BeautifulSoup
+
+          source = os.environ['SOURCE_URL']
+          root = Path('.')
+          assets = root / 'assets'
+          assets.mkdir(exist_ok=True)
+
+          s = requests.Session()
+          s.headers.update({'User-Agent':'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 Chrome/154 Safari/537.36'})
+          r = s.get(source, timeout=45)
+          r.raise_for_status()
+          html = r.text
+          if len(html) < 20000:
+              raise RuntimeError(f'HTML inesperadamente pequeno: {len(html)} bytes')
+
+          soup = BeautifulSoup(html, 'html.parser')
+
+          # A cópia é somente visual/estática: remove scripts, iframes, login e checkout remoto.
+          for tag in soup.find_all(['script','iframe']):
+              tag.decompose()
+          for tag in soup.find_all('form'):
+              tag['action'] = '#'
+              tag['onsubmit'] = 'return false'
+              tag.attrs.pop('method', None)
+
+          cache = {}
+          def ext_from(resp, url):
+              ct=(resp.headers.get('content-type') or '').split(';')[0].strip()
+              ext=mimetypes.guess_extension(ct) or Path(urlparse(url).path).suffix
+              if ext == '.jpe': ext='.jpg'
+              if not ext or len(ext)>7: ext='.bin'
+              return ext
+
+          def localize(raw):
+              if not raw or raw.startswith(('data:','blob:','#','mailto:','tel:','javascript:')):
+                  return raw
+              url=urljoin(source, raw)
+              if url in cache: return cache[url]
+              try:
+                  rr=s.get(url, timeout=30)
+                  rr.raise_for_status()
+                  ct=(rr.headers.get('content-type') or '').lower()
+                  if not (ct.startswith('image/') or 'font' in ct or 'css' in ct):
+                      return raw
+                  name=hashlib.sha1(url.encode()).hexdigest()[:16] + ext_from(rr,url)
+                  p=assets/name
+                  p.write_bytes(rr.content)
+                  cache[url]='assets/'+name
+                  return cache[url]
+              except Exception:
+                  return raw
+
+          # Imagens e ícones.
+          for tag in soup.find_all(['img','source']):
+              if tag.get('src'):
+                  tag['src']=localize(tag['src'])
+              if tag.get('srcset'):
+                  parts=[]
+                  for item in tag['srcset'].split(','):
+                      bits=item.strip().split()
+                      if bits:
+                          bits[0]=localize(bits[0])
+                          parts.append(' '.join(bits))
+                  tag['srcset']=', '.join(parts)
+
+          # Favicons e folhas CSS externas.
+          for link in soup.find_all('link'):
+              rel=' '.join(link.get('rel') or []).lower()
+              href=link.get('href')
+              if not href: continue
+              if 'stylesheet' in rel or 'icon' in rel:
+                  link['href']=localize(href)
+              elif 'preload' in rel or 'modulepreload' in rel:
+                  link.decompose()
+
+          # URLs de imagens em estilos inline/style blocks.
+          url_re=re.compile(r'url\(([^)]+)\)', re.I)
+          def repl_urls(text):
+              def repl(m):
+                  raw=m.group(1).strip().strip('"\'')
+                  loc=localize(raw)
+                  return 'url("'+loc+'")'
+              return url_re.sub(repl,text)
+          for st in soup.find_all('style'):
+              if st.string:
+                  st.string.replace_with(repl_urls(st.string))
+          for tag in soup.find_all(style=True):
+              tag['style']=repl_urls(tag['style'])
+
+          # Evita rotas internas inexistentes no clone estático.
+          for a in soup.find_all('a'):
+              h=a.get('href') or ''
+              if h.startswith('/'):
+                  a['href']='#'
+              if any(x in h.lower() for x in ['/login','checkout','cart','carrinho']):
+                  a['href']='#'
+
+          # Canonical local e comportamento seguro para links vazios/formulários.
+          can=soup.find('link', rel='canonical')
+          if can: can['href']='/'
+          safe=soup.new_tag('script')
+          safe.string="""document.addEventListener('click',function(e){var a=e.target.closest&&e.target.closest('a');if(a&&((a.getAttribute('href')||'')==='#'))e.preventDefault();});document.addEventListener('submit',function(e){e.preventDefault();});"""
+          if soup.body: soup.body.append(safe)
+
+          # Remove arquivos antigos do clone anterior; mantém .git e workflow.
+          for p in [root/'README.md']:
+              if p.exists(): p.unlink()
+          (root/'index.html').write_text(str(soup), encoding='utf-8')
+
+          print('HTML:', (root/'index.html').stat().st_size, 'bytes')
+          print('Assets baixados:', len(list(assets.glob('*'))))
+          PY
+          python /tmp/importar.py
+
+      - name: Validar saída
+        run: |
+          test -s index.html
+          grep -qi 'Panela de Arroz' index.html
+          echo "Arquivos: $(find assets -type f | wc -l) assets"
+
+      - name: Commitar site
+        run: |
+          git config user.name 'github-actions[bot]'
+          git config user.email '41898282+github-actions[bot]@users.noreply.github.com'
+          git add -A
+          git commit -m 'Subir site de panela baseado na referência original' || exit 0
+          git push
